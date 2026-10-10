@@ -26,8 +26,10 @@ bb auto-compact check [thread-id] [--json]
 bb auto-compact now [thread-id] [--json]
 ```
 
-- `status` prints whether auto-compact is enabled, the threshold percent,
-  and the cooldown.
+- `status` prints whether auto-compact is enabled, the global threshold,
+  provider overrides (or inheritance), and the cooldown. JSON uses
+  `providerThresholds` and `providerEnabledOverrides` with `null` meaning
+  “Use global”.
 - `check` runs the threshold check immediately against the given thread
   (defaults to the current thread when run inside one) and compacts it when
   over threshold. Use it to verify behavior instead of waiting for a thread
@@ -41,8 +43,9 @@ Every thread header has a **Compact** button (added by this plugin) that
 compacts the visible thread on demand, with a toast confirming the result.
 It works even when the thread is below the auto-compact threshold or when
 auto-compact is disabled. The button shows the thread's live context usage
-next to the label (turning red at the threshold) and a spinner while a
-compaction runs.
+next to the label (turning red at the effective provider threshold only when
+auto-compaction is on for that thread) and a spinner while a compaction runs.
+When off, the tooltip says “auto-compaction off”; manual compaction stays available.
 
 ## Limitations
 
@@ -53,13 +56,45 @@ checks skip quietly instead of retrying on every idle event.
 
 ## Settings
 
-Configure under Extensions → Plugins → Auto Compact, or via:
+Configure under Settings → Auto Compact. The table has one row per provider
+with Mode and Threshold side by side; **Default: …** displays inheritance
+(`"Use global"` in stored configuration). Changes save automatically. Or use:
 
 ```sh
 bb plugin config auto-compact set enabled false
-bb plugin config auto-compact set thresholdPercent 90
+bb plugin config auto-compact set claudeCodeEnabled On
+bb plugin config auto-compact set claudeCodeThresholdPercent 20
+bb plugin config auto-compact set codexEnabled Off
+bb plugin config auto-compact set codexEnabled "Use global"
 ```
 
-- `enabled` (boolean, default `true`) — master switch.
-- `thresholdPercent` (one of 70, 75, 80, 85, 90, 95; default `80`) —
-  context usage percent that triggers compaction.
+- `enabled` (boolean, default `true`) — global auto-compaction default. Provider
+  modes can override it in either direction. To stop the plugin entirely,
+  disable it with `bb plugin disable auto-compact`.
+- `claudeCodeEnabled`, `codexEnabled`, `piEnabled` (`"Use global"`, `"On"`, or
+  `"Off"`; default `"Use global"`) — provider auto-compaction modes. **On**
+  works even when the global default is off. **Off** skips this plugin's
+  automatic checks for that provider, leaving its native compaction policy
+  untouched. Manual compaction is still available.
+- `thresholdPercent` (5–95 in steps of 5; default `80`) — global context
+  usage percent that triggers compaction for all providers.
+- `claudeCodeThresholdPercent`, `codexThresholdPercent`, `piThresholdPercent`
+  (same percentages or `"Use global"`; default `"Use global"`) — optional
+  overrides for provider IDs `claude-code`, `codex`, and `pi`, respectively.
+  Inheritance follows changes to the global threshold. Other providers always
+  use the global threshold. An override does not enable compaction on a provider
+  that does not support it.
+
+Enablement and threshold inherit independently. A threshold override does not
+turn auto-compaction on; it is retained while off and applies when enabled.
+For example, use global Off, Claude Code On at 20%, and Codex Off to compact
+Claude around 200K tokens on a 1M window while leaving Codex to its harness.
+This is a compaction trigger, not a hard context limit; the current turn must
+settle and the cooldown can delay another compaction.
+
+Both automatic checks and the Compact button's usage indicator use the effective
+provider policy. Existing configuration remains valid. Lower thresholds compact
+sooner, after the current turn settles; the 15-minute cooldown still
+applies. All percentage settings are stored as strings and rendered as native
+BB dropdowns. A slider requires a custom settings section; these controls use
+BB's existing settings form and autosave.

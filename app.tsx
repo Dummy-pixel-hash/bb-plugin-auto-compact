@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
+import { CompactionSettings } from "./settings";
 
 /** Refresh the usage readout this often while the header is visible. */
 const POLL_MS = 30_000;
@@ -63,6 +64,7 @@ function CompactButton({ threadId }: { threadId: string }) {
   const [running, setRunning] = useState(false);
   const [percent, setPercent] = useState<number | null>(null);
   const [threshold, setThreshold] = useState(80);
+  const [autoEnabled, setAutoEnabled] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -72,6 +74,7 @@ function CompactButton({ threadId }: { threadId: string }) {
         if (!cancelled) {
           setPercent(usage.percent);
           setThreshold(usage.thresholdPercent);
+          setAutoEnabled(usage.enabled);
         }
       } catch {
         // Ephemeral read; the next poll retries.
@@ -108,16 +111,17 @@ function CompactButton({ threadId }: { threadId: string }) {
       const usage = await rpc.call("usage", { threadId });
       setPercent(usage.percent);
       setThreshold(usage.thresholdPercent);
+      setAutoEnabled(usage.enabled);
     } catch {
       // Readout refreshes on the next poll.
     }
   }
 
-  const hot = percent !== null && percent >= threshold;
+  const hot = autoEnabled === true && percent !== null && percent >= threshold;
   const title =
     percent === null
-      ? "Compact this thread now"
-      : `Context usage ${percent.toFixed(0)}%${hot ? ` (at the ${threshold}% auto-compact threshold)` : ""} — compact this thread now`;
+      ? `${autoEnabled === false ? "Auto-compaction off — " : ""}Compact this thread now`
+      : `Context usage ${percent.toFixed(0)}%${autoEnabled === false ? " (auto-compaction off)" : hot ? ` (at the ${threshold}% auto-compact threshold)` : ""} — compact this thread now`;
 
   return (
     <button
@@ -142,6 +146,29 @@ function CompactButton({ threadId }: { threadId: string }) {
 }
 
 export default definePluginApp((app) => {
+  app.contentScripts.register({
+    id: "compaction-settings-layout",
+    mount() {
+      const style = document.createElement("style");
+      style.textContent = `
+        /* The SDK has additive sections but no native-form replacement slot.
+           Hide the fallback only while our settings section renders successfully. */
+        body:has([data-auto-compact-settings]) [data-testid="plugin-detail-auto-compact"] > :has([aria-label="Global auto-compaction default"]) {
+          display: none;
+        }
+        body:has([data-testid="plugin-detail-auto-compact"]) [role="menu"] {
+          max-height: min(20rem, var(--radix-dropdown-menu-content-available-height, 20rem));
+          overflow-y: auto;
+        }
+      `;
+      document.head.append(style);
+      return () => style.remove();
+    },
+  });
+  app.slots.settingsSection({
+    id: "compaction-policies",
+    component: CompactionSettings,
+  });
   app.slots.experimental_threadHeaderAction({
     id: "compact-now",
     title: "Compact now",
