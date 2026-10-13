@@ -11,12 +11,18 @@ automatically once usage reaches a configurable percentage (default 80%).
 ## How it works
 
 - When a thread goes idle or fails, the plugin reads its `contextWindowUsage`
-  (used tokens vs. model window) and calls `threads.compact` if usage is at
-  or above the threshold.
+  (used tokens vs. model window) and compacts if usage is at or above the
+  threshold. Hermes ACP threads are skipped by automatic checks because
+  Hermes' internal `/compress` does not shrink BB's transcript; other providers
+  use BB's native `threads.compact` API.
 - A 15-minute per-thread cooldown prevents repeated compactions when usage
   stays high.
 - Compaction only ever runs on idle or failed threads, which is when BB
   allows it. Active threads are never interrupted.
+- Hermes ACP threads are opt-in for automatic successor creation. Enable
+  `hermesAutoSuccessor` when you want an over-threshold idle/failed Hermes
+  thread to be replaced by a bounded successor automatically; the source is
+  preserved.
 
 ## CLI
 
@@ -24,6 +30,7 @@ automatically once usage reaches a configurable percentage (default 80%).
 bb auto-compact status [--json]
 bb auto-compact check [thread-id] [--json]
 bb auto-compact now [thread-id] [--json]
+bb auto-compact compact-hermes <thread-id> [--archive] [--json]
 ```
 
 - `status` prints whether auto-compact is enabled, the threshold percent,
@@ -32,13 +39,17 @@ bb auto-compact now [thread-id] [--json]
   (defaults to the current thread when run inside one) and compacts it when
   over threshold. Use it to verify behavior instead of waiting for a thread
   to go idle.
-- `now` compacts immediately, bypassing threshold and cooldown. Same action
-  as the thread header's Compact button.
+- `now` compacts immediately, bypassing threshold and cooldown. On Hermes it
+  creates a bounded successor thread and preserves the source thread.
+- `compact-hermes` performs the Hermes successor operation explicitly. It
+  reads a bounded prompt history and latest output, creates a new Hermes thread
+  with a deterministic continuation seed, and leaves the source intact unless
+  `--archive` is supplied. It does not claim to rewrite the old BB transcript.
 
 ## Manual compaction
 
 Every thread header has a **Compact** button (added by this plugin) that
-compacts the visible thread on demand, with a toast confirming the result.
+requests compaction of the visible thread, with a toast confirming dispatch.
 It works even when the thread is below the auto-compact threshold or when
 auto-compact is disabled. The button shows the thread's live context usage
 next to the label (turning red at the threshold) and a spinner while a
@@ -46,10 +57,13 @@ compaction runs.
 
 ## Limitations
 
-Some providers cannot compact at all (certain ACP bridges fail with
+Some providers cannot compact in place (certain ACP bridges fail with
 "<provider> does not support manual compaction"). On those threads the
 Compact button says the provider doesn't support compaction, and automatic
-checks skip quietly instead of retrying on every idle event.
+checks skip quietly instead of retrying on every idle event. Hermes ACP is
+  automatically skipped because its documented `/compress` command does not
+  rewrite the BB transcript or reduce BB's displayed context usage. Use the
+  successor operation when an actually smaller BB context is required.
 
 ## Settings
 
@@ -63,3 +77,30 @@ bb plugin config auto-compact set thresholdPercent 90
 - `enabled` (boolean, default `true`) — master switch.
 - `thresholdPercent` (one of 70, 75, 80, 85, 90, 95; default `80`) —
   context usage percent that triggers compaction.
+- `hermesAutoSuccessor` (boolean, default `false`) — automatically create a
+  bounded Hermes successor at the threshold. This is a BB transcript
+  handoff, not Hermes' internal `/compress` operation.
+
+## Hermes-native optimization
+
+The Hermes auxiliary model and micro-compaction settings are read by Hermes
+from its own `config.yaml`; this plugin cannot safely rewrite that provider
+configuration. For a low-cost, low-stall setup, configure Hermes itself with
+an auxiliary compression model whose context window is large enough for the
+primary model, and optionally enable:
+
+```yaml
+compression:
+  enabled: true
+  threshold: 0.75
+  micro_compact: true
+  micro_compact_every_n_turns: 5
+  auxiliary:
+    compression:
+      model: deepseek/deepseek-v4-flash
+```
+
+Micro-compaction trades more frequent cache breaks for smaller, steadier
+contexts. Keep it disabled when prefix-cache savings matter more than latency.
+Warm-compaction context engines are likewise Hermes-native and must be
+installed and selected in Hermes; BB cannot activate them through this plugin.

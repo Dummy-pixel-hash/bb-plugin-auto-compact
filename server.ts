@@ -4,9 +4,10 @@
 // How it works: BB reports per-thread context usage on the thread timeline
 // (`contextWindowUsage`: used tokens vs. model window). When a thread goes
 // idle or fails — exactly the states where BB allows compaction — this plugin
-// reads that usage and calls `threads.compact` once it meets the threshold.
-// A per-thread cooldown keeps a thread whose usage stays high from being
-// compacted on every single idle event.
+// reads that usage and compacts once it meets the threshold. Hermes ACP does
+// not expose BB-native transcript compaction, so an explicit manual request
+// can materialize a small successor thread instead of falsely claiming that
+// Hermes' provider-local /compress changed BB's transcript.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
@@ -14,6 +15,9 @@ import { z } from "zod";
 const COOLDOWN_MS = 15 * 60_000;
 const LAST_COMPACT_KV_PREFIX = "last-compact:";
 const UNSUPPORTED_KV_PREFIX = "unsupported-compact:";
+const HERMES_PROVIDER_ID = "acp-hermes-agent";
+const HERMES_SUCCESSOR_MAX_CHARS = 48_000;
+const HERMES_PROMPT_LIMIT = 1_000;
 
 /** Percentage of `window` consumed by `used`, or null when unmeasurable. */
 export function usagePercent(
@@ -44,6 +48,91 @@ function isUnsupportedCompaction(error: unknown): boolean {
   return /does not support .*compaction/i.test(errorMessage(error));
 }
 
+function isHermesProvider(providerId: string | null | undefined): boolean {
+  return providerId === HERMES_PROVIDER_ID;
+}
+
+type TextInput = { type: "text"; text: string };
+
+function inputText(input: unknown): string {
+  if (!Array.isArray(input)) return "";
+  return input
+    .filter((item): item is TextInput =>
+      typeof item === "object" && item !== null &&
+      (item as { type?: unknown }).type === "text" &&
+      typeof (item as { text?: unknown }).text === "string",
+    )
+    .map((item) => item.text)
+    .join("\n")
+    .trim();
+}
+
+function clip(text: string, maxChars: number): string {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 40))}\n[… clipped …]`;
+}
+
+/**
+ * Build a bounded, deterministic continuation record. This is intentionally
+ * not an LLM summary: a 500k-token Hermes thread must be made smaller before
+ * another model request can be trusted to summarize it.
+ */
+export function buildHermesSuccessorSeed(args: {
+  sourceThreadId: string;
+  providerId: string;
+  prompts: readonly { id?: string; createdAt?: number; input?: unknown }[];
+  latestOutput?: string | null;
+}): string {
+  // BB returns prompt history newest-first. A successor must present the
+  // parent conversation chronologically, otherwise Hermes treats the newest
+  // request as an unrelated opening task. Keep the identifiers/timestamps so
+  // the snapshot is recognisably the parent's prompt manifest as well.
+  const prompts = args.prompts
+    .map((entry) => ({
+      id: entry.id,
+      createdAt: entry.createdAt,
+      text: inputText(entry.input),
+    }))
+    .filter((entry) => entry.text)
+    .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0));
+  const selected: Array<{ id?: string; createdAt?: number; text: string }> = prompts.length <= 40
+    ? prompts
+    : [
+        ...prompts.slice(0, 8),
+        { text: "[… middle parent prompts elided; see source thread for the full manifest …]" },
+        ...prompts.slice(-31),
+      ];
+  const promptBudget = Math.max(4_000, HERMES_SUCCESSOR_MAX_CHARS - 12_000);
+  const promptText = clip(
+    selected.map((entry, index) => {
+      const metadata = [
+        entry.id ? `id=${entry.id}` : null,
+        entry.createdAt ? `createdAt=${entry.createdAt}` : null,
+      ].filter(Boolean).join(", ");
+      return `Parent prompt ${index + 1}${metadata ? ` (${metadata})` : ""}:\n${clip(entry.text, 1_500)}`;
+    }).join("\n\n"),
+    promptBudget,
+  );
+  const output = clip(args.latestOutput ?? "", 10_000);
+  return clip(
+    [
+      "# Compacted Hermes continuation",
+      `Original BB thread: ${args.sourceThreadId}`,
+      `Provider: ${args.providerId}`,
+      "",
+      "This is the parent thread's compacted context snapshot, injected as agent-only context by BB. Treat the parent prompts below as the authoritative task history. The original thread was preserved separately; do not assume omitted tool output or hidden reasoning is present here.",
+      "",
+      promptText ? `Parent prompt manifest (chronological excerpts):\n${promptText}` : "Parent prompt manifest: unavailable",
+      "",
+      output ? `Latest assistant output:\n${output}` : "Latest assistant output: unavailable",
+      "",
+      "Continue the task from this record. Re-open files or re-check claims when the omitted transcript matters.",
+    ].join("\n"),
+    HERMES_SUCCESSOR_MAX_CHARS,
+  );
+}
+
 // RPC contract for the thread-header Compact button (app.tsx imports only
 // this contract's type; the backend module is erased from the bundle).
 const usageSchema = z.object({
@@ -60,6 +149,10 @@ export const rpcContract = defineRpcContract({
   usage: {
     input: z.object({ threadId: z.string().min(1) }).strict(),
     output: usageSchema,
+  },
+  compact_hermes: {
+    input: z.object({ threadId: z.string().min(1), archiveSource: z.boolean().optional() }).strict(),
+    output: z.object({ sourceThreadId: z.string(), successorThreadId: z.string(), seedChars: z.number() }).strict(),
   },
 });
 
@@ -79,6 +172,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Percentage of the model's context window at which a thread is compacted.",
       options: ["70", "75", "80", "85", "90", "95"],
       default: "80",
+    },
+    hermesAutoSuccessor: {
+      type: "boolean",
+      label: "Auto-create Hermes successors",
+      description:
+        "When on, an idle or failed Hermes ACP thread over the threshold gets a bounded successor; the source stays preserved.",
+      default: false,
     },
   });
   let cached = await settings.get();
@@ -115,10 +215,88 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function checkThread(threadId: string, trigger: string): Promise<string> {
+  async function compactThread(
+    threadId: string,
+  ): Promise<void> {
+    await bb.sdk.threads.compact({ threadId });
+  }
+
+  async function resolveProviderId(
+    threadId: string,
+  ): Promise<string | null | undefined> {
+    try {
+      return (await bb.sdk.threads.get({ threadId })).providerId;
+    } catch (error) {
+      // Older BB test hosts and SDK shims may not expose threads.get. Native
+      // compaction remains the safe fallback in that case.
+      bb.log.debug?.(
+        `Auto-compact: could not resolve provider for ${threadId}: ${errorMessage(error)}`,
+      );
+      return undefined;
+    }
+  }
+
+  async function materializeHermesSuccessor(
+    threadId: string,
+    archiveSource = false,
+  ): Promise<{ sourceThreadId: string; successorThreadId: string; seedChars: number }> {
+    const source = await bb.sdk.threads.get({ threadId });
+    if (!isHermesProvider(source.providerId)) {
+      throw new Error("successor compaction is only available for Hermes ACP threads");
+    }
+    const displayStatus = source.runtime.displayStatus;
+    if (displayStatus !== "idle" && displayStatus !== "error") {
+      throw new Error(`thread must be idle or errored (currently ${displayStatus})`);
+    }
+    const prompts = await bb.sdk.threads.promptHistory({
+      threadId,
+      limit: String(HERMES_PROMPT_LIMIT),
+    });
+    const latest = await bb.sdk.threads.output({ threadId });
+    const latestOutput = typeof latest === "string"
+      ? latest
+      : typeof latest?.output === "string" ? latest.output : null;
+    const seed = buildHermesSuccessorSeed({
+      sourceThreadId: threadId,
+      providerId: source.providerId,
+      prompts,
+      latestOutput,
+    });
+    const successor = await bb.sdk.threads.spawn({
+      projectId: source.projectId,
+      environment: source.environmentId
+        ? { type: "reuse", environmentId: source.environmentId }
+        : { type: "project-default" },
+      parentThreadId: threadId,
+      providerId: source.providerId,
+      title: `${source.title ?? "Hermes thread"} [compacted]`,
+      input: [{
+        type: "text",
+        text: `${seed}\n\nContinue the parent thread from this compacted context snapshot. Verify omitted details against the workspace and the preserved source thread when needed.`,
+        mentions: [],
+      }],
+      visibility: source.visibility,
+    });
+    if (archiveSource) await bb.sdk.threads.archive({ threadId });
+    return { sourceThreadId: threadId, successorThreadId: successor.id, seedChars: seed.length };
+  }
+
+  async function checkThread(
+    threadId: string,
+    trigger: string,
+    providerId?: string | null,
+  ): Promise<string> {
     if (!cached.enabled) return "skipped: auto-compact is disabled";
     if (inFlight.has(threadId)) {
       return "skipped: compaction already in progress";
+    }
+    const resolvedProviderId =
+      providerId === undefined
+        ? await resolveProviderId(threadId)
+        : providerId;
+    const hermes = isHermesProvider(resolvedProviderId);
+    if (hermes && !cached.hermesAutoSuccessor) {
+      return "skipped: Hermes ACP compression does not shrink the BB transcript";
     }
     const threshold = Number(cached.thresholdPercent);
     const unsupportedAt = await bb.storage.kv.get<number>(
@@ -146,7 +324,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
     inFlight.add(threadId);
     try {
-      await bb.sdk.threads.compact({ threadId });
+      if (hermes) {
+        const successor = await materializeHermesSuccessor(threadId, false);
+        await bb.storage.kv.set(
+          `${LAST_COMPACT_KV_PREFIX}${threadId}`,
+          Date.now(),
+        );
+        bb.log.info(
+          `Auto-compacted Hermes thread ${threadId} into successor ${successor.successorThreadId} at ${percent.toFixed(1)}% of context window (${trigger}, threshold ${threshold}%).`,
+        );
+        return `compacted into successor ${successor.successorThreadId} at ${percent.toFixed(1)}%`;
+      }
+      await compactThread(threadId);
     } catch (error) {
       if (isUnsupportedCompaction(error)) {
         await bb.storage.kv.set(
@@ -175,15 +364,23 @@ export default async function plugin(bb: BbPluginApi) {
     return `compacted at ${percent.toFixed(1)}%`;
   }
 
-  function onSettled(threadId: string, trigger: string): void {
-    void checkThread(threadId, trigger).catch((error: unknown) => {
+  function onSettled(
+    threadId: string,
+    trigger: string,
+    providerId: string | null | undefined,
+  ): void {
+    void checkThread(threadId, trigger, providerId).catch((error: unknown) => {
       bb.log.warn(
         `Auto-compact: check failed for thread ${threadId}: ${errorMessage(error)}`,
       );
     });
   }
-  bb.events.on("thread.idle", ({ thread }) => onSettled(thread.id, "idle"));
-  bb.events.on("thread.failed", ({ thread }) => onSettled(thread.id, "failed"));
+  bb.events.on("thread.idle", ({ thread }) =>
+    onSettled(thread.id, "idle", thread.providerId),
+  );
+  bb.events.on("thread.failed", ({ thread }) =>
+    onSettled(thread.id, "failed", thread.providerId),
+  );
 
   // Manual compaction: explicit user intent, so it bypasses the threshold
   // and cooldown. Still guards against overlapping compactions, and records
@@ -194,7 +391,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     inFlight.add(threadId);
     try {
-      await bb.sdk.threads.compact({ threadId });
+      const providerId = await resolveProviderId(threadId);
+      if (isHermesProvider(providerId)) {
+        const successor = await materializeHermesSuccessor(threadId, false);
+        return `compacted into successor ${successor.successorThreadId} (${successor.seedChars} chars); source preserved`;
+      }
+      await compactThread(threadId);
     } catch (error) {
       if (isUnsupportedCompaction(error)) {
         await bb.storage.kv.set(
@@ -229,6 +431,8 @@ export default async function plugin(bb: BbPluginApi) {
       ...(await readUsage(threadId)),
       thresholdPercent: Number(cached.thresholdPercent),
     }),
+    compact_hermes: async ({ threadId, archiveSource }) =>
+      materializeHermesSuccessor(threadId, archiveSource ?? false),
   });
 
   const usageText = [
@@ -236,6 +440,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb auto-compact status [--json]",
     "  bb auto-compact check [thread-id] [--json]",
     "  bb auto-compact now [thread-id] [--json]",
+    "  bb auto-compact compact-hermes <thread-id> [--archive] [--json]",
   ].join("\n");
   bb.cli.register({
     name: "auto-compact",
@@ -269,13 +474,14 @@ export default async function plugin(bb: BbPluginApi) {
           const value = {
             enabled: cached.enabled,
             thresholdPercent: Number(cached.thresholdPercent),
+            hermesAutoSuccessor: cached.hermesAutoSuccessor,
             cooldownMinutes: COOLDOWN_MS / 60_000,
           };
           return {
             exitCode: 0,
             stdout: json
               ? JSON.stringify(value)
-              : `enabled: ${value.enabled}\nthreshold: ${value.thresholdPercent}%\ncooldown: ${value.cooldownMinutes} min`,
+              : `enabled: ${value.enabled}\nthreshold: ${value.thresholdPercent}%\nhermes auto-successor: ${value.hermesAutoSuccessor}\ncooldown: ${value.cooldownMinutes} min`,
           };
         }
         case "check": {
@@ -303,6 +509,23 @@ export default async function plugin(bb: BbPluginApi) {
               ? JSON.stringify({ threadId, result })
               : `${threadId}: ${result}`,
           };
+        }
+        case "compact-hermes": {
+          const threadId = rest[0] ?? ctx.threadId ?? undefined;
+          const archiveSource = rest.includes("--archive");
+          if (threadId === undefined || rest.filter((arg) => arg !== "--archive").length > 1) {
+            return { exitCode: 1, stderr: usageText };
+          }
+          try {
+            const result = await materializeHermesSuccessor(threadId, archiveSource);
+            return {
+              exitCode: 0,
+              stdout: json ? JSON.stringify(result) :
+                `${result.sourceThreadId} -> ${result.successorThreadId} (${result.seedChars} chars)`,
+            };
+          } catch (error) {
+            return { exitCode: 1, stderr: errorMessage(error) };
+          }
         }
         default:
           return { exitCode: 1, stderr: usageText };

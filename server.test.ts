@@ -3,7 +3,7 @@ import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { usagePercent } from "./server";
+import plugin, { buildHermesSuccessorSeed, usagePercent } from "./server";
 
 const THREAD_ID = "thr_test1";
 
@@ -70,6 +70,42 @@ describe("usagePercent", () => {
 });
 
 describe("auto-compact on thread events", () => {
+  it("can automatically create a preserved Hermes successor at the threshold", async () => {
+    const spawnCalls: unknown[] = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "auto-compact",
+      sdk: {
+        threads: {
+          timeline: async () => timelineWith(180_000, 200_000),
+          get: async () => ({
+            id: THREAD_ID,
+            projectId: "proj_test",
+            environmentId: "env_test",
+            providerId: "acp-hermes-agent",
+            runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+            title: "Hermes task",
+            visibility: "visible",
+          }),
+          promptHistory: async () => [
+            { id: "p1", createdAt: 1, input: [{ type: "text", text: "Keep working" }] },
+          ],
+          output: async () => ({ output: "Current state" }),
+          spawn: async (args: unknown) => {
+            spawnCalls.push(args);
+            return { id: "thr_hermes_successor" };
+          },
+        },
+      },
+    });
+    await plugin(bb);
+    await harness.behavior.setSettings({ hermesAutoSuccessor: true });
+    const result = await harness.behavior.runCli(["check", THREAD_ID]);
+    expect(result.stdout).toContain("compacted into successor thr_hermes_successor");
+    expect(spawnCalls).toHaveLength(1);
+    expect((spawnCalls[0] as { parentThreadId: string }).parentThreadId).toBe(THREAD_ID);
+    await harness.lifecycle.dispose();
+  });
+
   it("compacts an idle thread at or above the threshold", async () => {
     const { harness, compactCalls } = await loadHost(170_000);
     await harness.behavior.emitThreadEvent("thread.idle", {
@@ -218,6 +254,64 @@ describe("providers without compaction support", () => {
 });
 
 describe("manual compaction", () => {
+  it("materializes a bounded Hermes successor instead of lying about in-place compaction", async () => {
+    const spawnCalls: unknown[] = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "auto-compact",
+      sdk: {
+        threads: {
+          get: async () => ({
+            id: THREAD_ID,
+            projectId: "proj_test",
+            environmentId: "env_test",
+            providerId: "acp-hermes-agent",
+            runtime: { displayStatus: "idle", hostReconnectGraceExpiresAt: null },
+            title: "Long Hermes task",
+            visibility: "visible",
+          }),
+          promptHistory: async () => [
+            { id: "p1", createdAt: 1, input: [{ type: "text", text: "Inspect the service" }] },
+            { id: "p2", createdAt: 2, input: [{ type: "text", text: "Now fix the timeout" }] },
+          ],
+          output: async () => ({ output: "The timeout is in the retry loop." }),
+          spawn: async (args: unknown) => {
+            spawnCalls.push(args);
+            return { id: "thr_successor" };
+          },
+        },
+      },
+    });
+    await plugin(bb);
+    const result = await harness.behavior.callRpc("compact_now", {
+      threadId: THREAD_ID,
+    });
+    expect(result).toEqual({
+      result: expect.stringContaining("compacted into successor thr_successor"),
+    });
+    expect(spawnCalls).toHaveLength(1);
+    expect((spawnCalls[0] as { parentThreadId: string }).parentThreadId)
+      .toBe(THREAD_ID);
+    expect((spawnCalls[0] as { input: { text: string }[] }).input[0]!.text)
+      .toContain("Parent prompt manifest");
+    expect((spawnCalls[0] as { input: { text: string }[] }).input[0]!.text)
+      .toContain("Continue the parent thread");
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the successor seed bounded for oversized histories", () => {
+    const seed = buildHermesSuccessorSeed({
+      sourceThreadId: THREAD_ID,
+      providerId: "acp-hermes-agent",
+      prompts: Array.from({ length: 200 }, (_, index) => ({
+        input: [{ type: "text", text: `prompt ${index} ${"x".repeat(10_000)}` }],
+      })),
+      latestOutput: "y".repeat(50_000),
+    });
+    expect(seed.length).toBeLessThanOrEqual(48_000);
+    expect(seed).toContain("middle parent prompts elided");
+    expect(seed).toContain("prompt 0");
+  });
+
   it("compact_now RPC compacts regardless of threshold", async () => {
     const { harness, compactCalls } = await loadHost(10_000);
     const result = await harness.behavior.callRpc("compact_now", {
@@ -268,6 +362,7 @@ describe("auto-compact CLI", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({
       enabled: true,
       thresholdPercent: 80,
+      hermesAutoSuccessor: false,
     });
     await harness.lifecycle.dispose();
   });
