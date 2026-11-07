@@ -1,14 +1,14 @@
 // bb-plugin-auto-compact — compact a thread's context window automatically
 // when usage reaches a configurable percentage.
 //
-// How it works: BB reports per-thread context usage on the thread timeline
-// (`contextWindowUsage`: used tokens vs. model window). When a thread goes
+// How it works: BB reports per-thread context usage (`threads.context`: used
+// tokens vs. model window). When a thread goes
 // idle or fails — exactly the states where BB allows compaction — this plugin
 // reads that usage and calls `threads.compact` once it meets the threshold.
 // A per-thread cooldown keeps a thread whose usage stays high from being
 // compacted on every single idle event.
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { z } from "zod";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { rpcContract, usageTag } from "./contract";
 
 /** Minimum time between two auto-compactions of the same thread. */
 const COOLDOWN_MS = 15 * 60_000;
@@ -44,25 +44,6 @@ function isUnsupportedCompaction(error: unknown): boolean {
   return /does not support .*compaction/i.test(errorMessage(error));
 }
 
-// RPC contract for the thread-header Compact button (app.tsx imports only
-// this contract's type; the backend module is erased from the bundle).
-const usageSchema = z.object({
-  percent: z.number().nullable(),
-  usedTokens: z.number().nullable(),
-  modelContextWindow: z.number().nullable(),
-  thresholdPercent: z.number(),
-});
-export const rpcContract = defineRpcContract({
-  compact_now: {
-    input: z.object({ threadId: z.string().min(1) }).strict(),
-    output: z.object({ result: z.string() }),
-  },
-  usage: {
-    input: z.object({ threadId: z.string().min(1) }).strict(),
-    output: usageSchema,
-  },
-});
-
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     enabled: {
@@ -84,6 +65,7 @@ export default async function plugin(bb: BbPluginApi) {
   let cached = await settings.get();
   settings.onChange((next) => {
     cached = next;
+    bb.rpc.experimental_invalidateAll();
   });
 
   // Threads currently being compacted; prevents overlapping compactions of
@@ -96,16 +78,14 @@ export default async function plugin(bb: BbPluginApi) {
     modelContextWindow: number | null;
   }> {
     try {
-      const timeline = await bb.sdk.threads.timeline({ threadId });
-      const used = timeline.contextWindowUsage?.usedTokens;
-      const window = timeline.contextWindowUsage?.modelContextWindow;
+      const { usage } = await bb.sdk.threads.context({ threadId });
+      if (usage === null) {
+        return { percent: null, usedTokens: null, modelContextWindow: null };
+      }
       return {
-        percent:
-          used === undefined || window === undefined
-            ? null
-            : usagePercent(used, window),
-        usedTokens: used ?? null,
-        modelContextWindow: window ?? null,
+        percent: usagePercent(usage.usedTokens, usage.modelContextWindow),
+        usedTokens: usage.usedTokens,
+        modelContextWindow: usage.modelContextWindow,
       };
     } catch (error) {
       bb.log.warn(
@@ -176,6 +156,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function onSettled(threadId: string, trigger: string): void {
+    bb.rpc.experimental_invalidate([usageTag(threadId)]);
     void checkThread(threadId, trigger).catch((error: unknown) => {
       bb.log.warn(
         `Auto-compact: check failed for thread ${threadId}: ${errorMessage(error)}`,
@@ -225,10 +206,16 @@ export default async function plugin(bb: BbPluginApi) {
     compact_now: async ({ threadId }) => ({
       result: await forceCompact(threadId),
     }),
-    usage: async ({ threadId }) => ({
-      ...(await readUsage(threadId)),
-      thresholdPercent: Number(cached.thresholdPercent),
-    }),
+    usage: async ({ keys }) => {
+      const thresholdPercent = Number(cached.thresholdPercent);
+      const entries = await Promise.all(
+        keys.map(
+          async (threadId) =>
+            [threadId, { ...(await readUsage(threadId)), thresholdPercent }] as const,
+        ),
+      );
+      return Object.fromEntries(entries);
+    },
   });
 
   const usageText = [
