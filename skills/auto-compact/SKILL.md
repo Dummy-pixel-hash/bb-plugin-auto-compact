@@ -10,7 +10,7 @@ automatically once usage reaches a configurable percentage (default 80%).
 
 ## How it works
 
-- When a thread goes idle or fails, the plugin reads its `contextWindowUsage`
+- When a thread goes idle or fails, the plugin reads its context usage
   (used tokens vs. model window) and calls `threads.compact` if usage is at
   or above the threshold.
 - A 15-minute per-thread cooldown prevents repeated compactions when usage
@@ -33,22 +33,22 @@ bb auto-compact now [thread-id] [--json]
   over threshold. Use it to verify behavior instead of waiting for a thread
   to go idle.
 - `now` compacts immediately, bypassing threshold and cooldown. Same action
-  as the thread header's Compact button.
+  as the thread header's Compact action.
 
 ## Manual compaction
 
-Every thread header has a **Compact** button (added by this plugin) that
+Every thread header has a **Compact** action (added by this plugin) that
 compacts the visible thread on demand, with a toast confirming the result.
 It works even when the thread is below the auto-compact threshold or when
-auto-compact is disabled. The button shows the thread's live context usage
-next to the label (turning red at the threshold) and a spinner while a
-compaction runs.
+auto-compact is disabled. Its label shows the thread's context usage, which
+refreshes when a turn finishes, and reads "Compacting" while a compaction
+runs.
 
 ## Limitations
 
 Some providers cannot compact at all (certain ACP bridges fail with
 "<provider> does not support manual compaction"). On those threads the
-Compact button says the provider doesn't support compaction, and automatic
+Compact action says the provider doesn't support compaction, and automatic
 checks skip quietly instead of retrying on every idle event.
 
 ## Settings

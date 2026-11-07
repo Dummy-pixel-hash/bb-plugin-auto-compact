@@ -7,9 +7,9 @@ import plugin, { usagePercent } from "./server";
 
 const THREAD_ID = "thr_test1";
 
-function timelineWith(usedTokens: number, modelContextWindow: number) {
+function contextWith(usedTokens: number, modelContextWindow: number) {
   return {
-    contextWindowUsage: {
+    usage: {
       estimated: false,
       modelContextWindow,
       usedTokens,
@@ -36,7 +36,7 @@ async function loadHost(
     pluginId: "auto-compact",
     sdk: {
       threads: {
-        timeline: async () => timelineWith(usedTokens, modelContextWindow),
+        context: async () => contextWith(usedTokens, modelContextWindow),
         compact: (args: { threadId: string }) => compact(args, compactCalls),
       },
     },
@@ -143,16 +143,18 @@ describe("auto-compact on thread events", () => {
 });
 
 describe("usage RPC", () => {
-  it("reports percent, tokens, window, and threshold", async () => {
+  it("reports percent, tokens, window, and threshold per thread", async () => {
     const { harness } = await loadHost(170_000);
     const result = await harness.behavior.callRpc("usage", {
-      threadId: THREAD_ID,
+      keys: [THREAD_ID],
     });
     expect(result).toEqual({
-      percent: 85,
-      usedTokens: 170_000,
-      modelContextWindow: 200_000,
-      thresholdPercent: 80,
+      [THREAD_ID]: {
+        percent: 85,
+        usedTokens: 170_000,
+        modelContextWindow: 200_000,
+        thresholdPercent: 80,
+      },
     });
     await harness.lifecycle.dispose();
   });
@@ -160,8 +162,20 @@ describe("usage RPC", () => {
   it("rejects an empty thread id", async () => {
     const { harness } = await loadHost(170_000);
     await expect(
-      harness.behavior.callRpc("usage", { threadId: "" }),
+      harness.behavior.callRpc("usage", { keys: [""] }),
     ).rejects.toThrow();
+    await harness.lifecycle.dispose();
+  });
+
+  it("refreshes a thread's usage when its turn settles", async () => {
+    const { harness } = await loadHost(10_000);
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD_ID }),
+      lastAssistantText: "done",
+    });
+    expect(harness.inspection.experimental_rpcInvalidations).toContainEqual([
+      `usage:${THREAD_ID}`,
+    ]);
     await harness.lifecycle.dispose();
   });
 });
